@@ -4,7 +4,6 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -357,29 +356,6 @@ func (s *ChunkExtractService) Handle(ctx context.Context, t *asynq.Task) error {
 
 	for _, node := range graph.Node {
 		node.Chunks = []string{chunk.ID}
-	}
-	commitLease, leaseErr := acquireKnowledgeProcessLease(ctx, s.redisClient, p.TenantID, chunk.KnowledgeID)
-	if leaseErr != nil {
-		if errors.Is(leaseErr, ErrKnowledgeProcessLeaseBusy) {
-			if err := rescheduleTaskAfterKnowledgeLeaseBusy(ctx, s.taskEnqueuer, nil, t, chunk.KnowledgeID, p.Attempt); err != nil {
-				return err
-			}
-			rescheduled = true
-			graphOut["rescheduled"] = "lease_busy"
-			return nil
-		}
-		handleErr = leaseErr
-		return leaseErr
-	}
-	ctx = commitLease.Context
-	defer commitLease.Release()
-	if err := commitLease.Err(); err != nil {
-		if attemptSuperseded(context.WithoutCancel(ctx), s.knowledgeRepo, p.TenantID, chunk.KnowledgeID, p.Attempt) {
-			graphOut["skipped"] = "attempt_superseded_before_graph_commit"
-			return nil
-		}
-		handleErr = err
-		return err
 	}
 	if attemptSuperseded(ctx, s.knowledgeRepo, p.TenantID, chunk.KnowledgeID, p.Attempt) {
 		graphOut["skipped"] = "attempt_superseded_before_graph_commit"

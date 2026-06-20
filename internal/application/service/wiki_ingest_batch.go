@@ -3,6 +3,7 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
@@ -22,9 +23,8 @@ import (
 // still pending ops in task_pending_ops for this KB. Returns true when
 // a follow-up was scheduled.
 //
-// We use a short ProcessIn (5s) so the active-batch lock has time to
-// release before the next worker tries to acquire it; otherwise we'd
-// just bounce on ErrWikiIngestConcurrent and burn an asynq retry slot.
+// We use a short ProcessIn (5s) so the active-batch lease has time to
+// release before the next worker tries to acquire it.
 func (s *wikiIngestService) scheduleFollowUp(ctx context.Context, payload WikiIngestPayload) bool {
 	if s.pendingRepo == nil {
 		return false
@@ -110,75 +110,35 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		ctx = context.WithValue(ctx, types.LanguageContextKey, payload.Language)
 	}
 
-	// Try to acquire the "active batch" flag (non-blocking).
-	//
-	// TTL is intentionally short (wikiActiveLockTTL ≈ 60s) so that if the
-	// owning process dies without releasing the lock (crash, kill -9,
-	// container restart), the orphaned key expires within ~1 minute and new
-	// tasks aren't starved. A renew goroutine keeps the lock alive while
-	// the handler is genuinely running.
-	if s.redisClient != nil {
-		activeKey := wikiActiveKeyPrefix + payload.KnowledgeBaseID
-		activeToken := uuid.NewString()
-		acquired, err := s.redisClient.SetNX(ctx, activeKey, activeToken, wikiActiveLockTTL).Result()
-		if err != nil {
-			logger.Warnf(ctx, "wiki ingest: redis SetNX failed: %v", err)
-		} else if !acquired {
-			exitStatus = "active_lock_conflict"
-			// If task_pending_ops is already empty for this KB, the active
-			// batch will drain whatever was queued. Returning nil avoids
-			// burning through the retry budget on tasks that would be
-			// no-ops when they eventually acquire the lock. If rows still
-			// remain, retry so we don't miss them in case the active
-			// batch drained its peek before our op landed.
-			n, nErr := s.pendingRepo.PendingCount(ctx, wikiTaskType, wikiTaskScope, payload.KnowledgeBaseID)
-			if nErr != nil {
-				logger.Warnf(ctx, "wiki ingest: failed to read pending count during lock conflict for KB %s: %v", payload.KnowledgeBaseID, nErr)
-				logger.Infof(ctx, "wiki ingest: another batch active for KB %s, deferring to asynq retry", payload.KnowledgeBaseID)
-				return ErrWikiIngestConcurrent
-			}
-			if n == 0 {
-				exitStatus = "active_lock_conflict_empty"
-				logger.Infof(ctx, "wiki ingest: concurrent batch active for KB %s, pending queue empty — skipping", payload.KnowledgeBaseID)
-				return nil
-			}
-			logger.Infof(ctx, "wiki ingest: another batch active for KB %s, deferring to asynq retry", payload.KnowledgeBaseID)
-			return ErrWikiIngestConcurrent
-		}
-		lockAcquired = acquired
-
-		lockedCtx, cancelLock := context.WithCancel(ctx)
-		ctx = lockedCtx
-		defer func() {
-			cancelLock()
-			releaseRedisTokenLease(context.Background(), s.redisClient, activeKey, activeToken)
-		}()
-
-		go func() {
-			ticker := time.NewTicker(wikiActiveLockRenew)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					if ok := renewRedisTokenLease(context.Background(), s.redisClient, activeKey, activeToken, wikiActiveLockTTL); !ok {
-						cancelLock()
-						return
-					}
-				}
-			}
-		}()
-	} else {
+	if s.redisClient == nil {
 		mode = "lite"
-		// In-process mutual exclusion: mirrors the Redis SetNX lock above.
-		if _, loaded := s.liteLocks.LoadOrStore(payload.KnowledgeBaseID, struct{}{}); loaded {
-			exitStatus = "active_lock_conflict"
-			logger.Infof(ctx, "wiki ingest: another batch active for KB %s (lite lock), deferring to asynq retry", payload.KnowledgeBaseID)
-			return ErrWikiIngestConcurrent
+	}
+	leaseKey := "wiki-batch:" + payload.KnowledgeBaseID
+	batchLease, err := acquireRedisTokenLease(ctx, s.redisClient, leaseKey, wikiBatchLeaseTTL)
+	if errors.Is(err, ErrLeaseBusy) {
+		exitStatus = "batch_lock_conflict"
+		logger.Infof(ctx, "wiki ingest: another batch active for KB %s, scheduling retry trigger", payload.KnowledgeBaseID)
+		if enqueueErr := enqueueWikiIngestTrigger(ctx, s.task, payload, wikiBatchBusyDelay); enqueueErr != nil {
+			logger.Warnf(ctx, "wiki ingest: failed to requeue busy batch for KB %s: %v", payload.KnowledgeBaseID, enqueueErr)
+		} else {
+			followUpScheduled = true
 		}
-		lockAcquired = true
-		defer s.liteLocks.Delete(payload.KnowledgeBaseID)
+		return nil
+	}
+	if err != nil {
+		exitStatus = "batch_lock_failed"
+		return fmt.Errorf("wiki ingest: acquire batch lease: %w", err)
+	}
+	lockAcquired = true
+	ctx = batchLease.Context
+	defer batchLease.Release()
+	ensureBatchLease := func(stage string) bool {
+		if err := batchLease.Err(); err != nil {
+			exitStatus = "batch_lock_lost"
+			logger.Warnf(ctx, "wiki ingest: batch lease lost before %s for KB %s: %v", stage, payload.KnowledgeBaseID, err)
+			return false
+		}
+		return true
 	}
 
 	kb, err := s.kbService.GetKnowledgeBaseByIDOnly(ctx, payload.KnowledgeBaseID)
@@ -356,6 +316,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// 1. MAP PHASE (Parallel extraction and generation of updates)
 	var mapMu sync.Mutex
 	var failedOps []WikiPendingOp
+	consumedOpIDs := make(map[int64]struct{})
 	slugUpdates := make(map[string][]SlugUpdate)
 	var docResults []*docIngestResult
 	var retractChangeDesc strings.Builder
@@ -475,12 +436,25 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				// "finalizing" until the housekeeping sweep marks it
 				// failed. The matching +1 was seeded by
 				// KnowledgePostProcess.SetFinalizing.
-				s.finalizeWikiSubtask(mapCtx, op)
+				if consumed, err := s.consumePendingIDs(mapCtx, op.dbIDs); err != nil {
+					logger.Warnf(mapCtx, "wiki ingest: failed to consume terminal skipped op %s: %v", op.KnowledgeID, err)
+				} else if consumed {
+					mapMu.Lock()
+					for _, id := range op.dbIDs {
+						consumedOpIDs[id] = struct{}{}
+					}
+					mapMu.Unlock()
+					s.finalizeWikiSubtask(mapCtx, op)
+				}
 			}
 			return nil
 		})
 	}
 	_ = eg.Wait()
+
+	if !ensureBatchLease("taxonomy planning") {
+		return ErrLeaseLost
+	}
 
 	// Plan the directory once for the whole batch BEFORE reduce. Reduce writes
 	// pages in parallel, so it can't converge on shared folders on its own; this
@@ -491,6 +465,9 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		s.planBatchTaxonomy(ctx, chatModel, kb, slugUpdates, lang))
 
 	// 2. REDUCE PHASE (Parallel upserting grouped by Slug)
+	if !ensureBatchLease("reduce") {
+		return ErrLeaseLost
+	}
 	egReduce, reduceCtx := errgroup.WithContext(ctx)
 	egReduce.SetLimit(reduceParallel) // Reduce phase limit (LLM + DB concurrent connections, configurable)
 
@@ -544,6 +521,10 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		})
 	}
 	_ = egReduce.Wait()
+
+	if !ensureBatchLease("post-reduce writes") {
+		return ErrLeaseLost
+	}
 
 	// Sanitize the doc summary pages produced by this batch BEFORE we
 	// build log entries / rebuild the index. The summary LLM (run during
@@ -673,6 +654,9 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		logger.Infof(ctx, "wiki ingest: injecting cross links")
 		s.injectCrossLinks(ctx, payload.KnowledgeBaseID, allPagesAffected, freshRefs, batchCtx)
 
+		if !ensureBatchLease("publish") {
+			return ErrLeaseLost
+		}
 		logger.Infof(ctx, "wiki ingest: publishing draft pages")
 		s.publishDraftPages(ctx, payload.KnowledgeBaseID, allPagesAffected)
 	}
@@ -696,12 +680,25 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		// the WikiSpan nil-check below so a doc that had no attempt to
 		// attach a span to still drains its counter slot. The matching +1
 		// is seeded by KnowledgePostProcess.SetFinalizing.
-		s.finalizeWikiSubtask(ctx, WikiPendingOp{
-			Op:          WikiOpIngest,
-			TenantID:    r.TenantID,
-			KnowledgeID: r.KnowledgeID,
-			Attempt:     r.Attempt,
-		})
+		if !ensureBatchLease("successful op drain") {
+			return ErrLeaseLost
+		}
+		consumed, consumeErr := s.consumePendingIDs(ctx, r.OpIDs)
+		if consumeErr != nil {
+			logger.Warnf(ctx, "wiki ingest: failed to consume successful op %s: %v", r.KnowledgeID, consumeErr)
+			return consumeErr
+		}
+		for _, id := range r.OpIDs {
+			consumedOpIDs[id] = struct{}{}
+		}
+		if consumed {
+			s.finalizeWikiSubtask(ctx, WikiPendingOp{
+				Op:          WikiOpIngest,
+				TenantID:    r.TenantID,
+				KnowledgeID: r.KnowledgeID,
+				Attempt:     r.Attempt,
+			})
+		}
 		if r.WikiSpan == nil {
 			continue
 		}
@@ -753,7 +750,13 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		if _, fail := failedIDSet[id]; fail {
 			continue
 		}
+		if _, consumed := consumedOpIDs[id]; consumed {
+			continue
+		}
 		trimIDs = append(trimIDs, id)
+	}
+	if !ensureBatchLease("pending trim") {
+		return ErrLeaseLost
 	}
 	s.trimPendingList(ctx, trimIDs)
 
@@ -1225,6 +1228,7 @@ func (s *wikiIngestService) mapOneDocument(
 		KnowledgeID: knowledgeID,
 		TenantID:    op.TenantID,
 		Attempt:     op.Attempt,
+		OpIDs:       append([]int64(nil), op.dbIDs...),
 		DocTitle:    docTitle,
 		Summary:     docSummaryLine,
 		Pages:       extractedPages,

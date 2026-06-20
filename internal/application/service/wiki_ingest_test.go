@@ -136,6 +136,54 @@ func TestEnqueueWikiIngestRejectsMissingAttempt(t *testing.T) {
 	}
 }
 
+func TestWikiIngestConsumeBeforeDrainPreventsDoubleDecrement(t *testing.T) {
+	db := setupHousekeepingDB(t)
+	ctx := context.Background()
+	knowledgeID := "kid-double-drain"
+	insertKnowledgeInKB(t, db, knowledgeID, "kb-1", types.ParseStatusFinalizing, time.Now())
+	require.NoError(t, db.Exec(
+		`UPDATE knowledges SET pending_subtasks_count = 3, current_process_attempt = 1 WHERE id = ?`, knowledgeID,
+	).Error)
+
+	pendingRepo := repository.NewTaskPendingOpsRepository(db)
+	pending := &types.TaskPendingOp{
+		TenantID: 1,
+		TaskType: wikiTaskType,
+		Scope:    wikiTaskScope,
+		ScopeID:  "kb-1",
+		Op:       WikiOpIngest,
+		DedupKey: knowledgeID,
+		Payload:  []byte(`{}`),
+	}
+	require.NoError(t, pendingRepo.Enqueue(ctx, pending))
+	service := &wikiIngestService{
+		pendingRepo:   pendingRepo,
+		knowledgeRepo: repository.NewKnowledgeRepository(db),
+	}
+	op := WikiPendingOp{
+		Op:          WikiOpIngest,
+		TenantID:    1,
+		KnowledgeID: knowledgeID,
+		Attempt:     1,
+	}
+
+	for i := 0; i < 2; i++ {
+		consumed, err := service.consumePendingIDs(ctx, []int64{pending.ID})
+		require.NoError(t, err)
+		if consumed {
+			service.finalizeWikiSubtask(ctx, op)
+		}
+	}
+
+	var status string
+	var count int
+	require.NoError(t, db.Raw(
+		`SELECT parse_status, pending_subtasks_count FROM knowledges WHERE id = ?`, knowledgeID,
+	).Row().Scan(&status, &count))
+	assert.Equal(t, types.ParseStatusFinalizing, status)
+	assert.Equal(t, 2, count, "same wiki op row must only drain one counted slot")
+}
+
 func TestAppendUnique(t *testing.T) {
 	arr := types.StringArray{"a", "b"}
 

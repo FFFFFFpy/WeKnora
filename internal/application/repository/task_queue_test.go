@@ -182,6 +182,29 @@ func TestTaskPendingOps_DeleteByIDs_RemovesOnlyTargets(t *testing.T) {
 	assert.Equal(t, "b", got[0].DedupKey)
 }
 
+func TestTaskPendingOps_ConsumeByIDs_ReturnsRowsAffected(t *testing.T) {
+	db := setupTaskQueueTestDB(t)
+	repo := NewTaskPendingOpsRepository(db)
+	ctx := context.Background()
+
+	a := makePendingOp("wiki:ingest", "knowledge_base", "kb", "ingest", "a", nil)
+	b := makePendingOp("wiki:ingest", "knowledge_base", "kb", "ingest", "b", nil)
+	require.NoError(t, repo.Enqueue(ctx, a))
+	require.NoError(t, repo.Enqueue(ctx, b))
+
+	deleted, err := repo.ConsumeByIDs(ctx, []int64{a.ID, b.ID})
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), deleted)
+
+	deleted, err = repo.ConsumeByIDs(ctx, []int64{a.ID, b.ID})
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+
+	deleted, err = repo.ConsumeByIDs(ctx, nil)
+	require.NoError(t, err)
+	assert.Equal(t, int64(0), deleted)
+}
+
 // TestTaskPendingOps_IncrFailCount_ReturnsNewValueAndPersists exercises
 // the UPDATE...RETURNING flow. Successive bumps should observe monotonic
 // counts.

@@ -53,6 +53,37 @@ func TestKnowledgeProcessLeaseLiteScopesByKnowledge(t *testing.T) {
 	leaseB.Release()
 }
 
+func TestTokenLeaseMemorySerializesByKey(t *testing.T) {
+	ctx := context.Background()
+
+	lease, err := acquireRedisTokenLease(ctx, nil, "wiki-batch:kb-1", time.Minute)
+	require.NoError(t, err)
+	defer lease.Release()
+
+	_, err = acquireRedisTokenLease(ctx, nil, "wiki-batch:kb-1", time.Minute)
+	require.Error(t, err)
+	assert.True(t, errors.Is(err, ErrLeaseBusy))
+
+	other, err := acquireRedisTokenLease(ctx, nil, "wiki-batch:kb-2", time.Minute)
+	require.NoError(t, err)
+	other.Release()
+
+	lease.Release()
+	again, err := acquireRedisTokenLease(ctx, nil, "wiki-batch:kb-1", time.Minute)
+	require.NoError(t, err)
+	again.Release()
+}
+
+func TestTokenLeaseErrReportsLostContext(t *testing.T) {
+	ctx := context.Background()
+	lease, err := acquireRedisTokenLease(ctx, nil, "wiki-batch:lost", time.Minute)
+	require.NoError(t, err)
+	lease.Cancel()
+
+	assert.ErrorIs(t, lease.Err(), ErrLeaseLost)
+	lease.Release()
+}
+
 func TestKnowledgeProcessLeaseLiteHighContentionSerializes(t *testing.T) {
 	ctx := context.Background()
 	svc := &knowledgeService{}

@@ -8,7 +8,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"text/template"
 	"time"
 	"unicode/utf8"
@@ -24,22 +23,9 @@ import (
 	"github.com/redis/go-redis/v9"
 )
 
-// ErrWikiIngestConcurrent is returned by the wiki ingest handler when another
-// batch is already running for the same KB (i.e. the `wiki:active:<kbID>`
-// Redis lock is held). The asynq server's RetryDelayFunc uses errors.Is on
-// this sentinel to apply a short, fixed retry delay instead of asynq's default
-// exponential backoff — otherwise a freshly orphaned lock (e.g. from a crash
-// or restart) would force newcomers to wait minutes even after the lock
-// naturally expires.
-var ErrWikiIngestConcurrent = errors.New("concurrent wiki task active")
-
 const (
 	// maxContentForWiki limits the document content sent to LLM for wiki generation
 	maxContentForWiki = 32768
-
-	// wikiActiveKeyPrefix is the Redis key for the "batch in progress" flag.
-	// Key format: wiki:active:{kbID} → "1" with TTL. Prevents concurrent batches.
-	wikiActiveKeyPrefix = "wiki:active:"
 
 	// wikiIngestDelay is how long to wait after a document is added before
 	// the batch task fires. Debounces rapid uploads.
@@ -66,7 +52,7 @@ const (
 	// wikiTriggerUniqueTTL debounces duplicate KB wakeup triggers. The
 	// per-KB active lock remains the correctness guard for concurrent
 	// workers; Unique only cuts redundant queue noise.
-	wikiTriggerUniqueTTL = 10 * time.Minute
+	wikiTriggerUniqueTTL = 60 * time.Minute
 
 	// wikiDeletedKeyPrefix is the Redis key prefix for "recently deleted
 	// knowledge" tombstones. Key: wiki:deleted:{kbID}:{knowledgeID}. Written
@@ -80,19 +66,15 @@ const (
 	// exceed the longest plausible ingest run (LLM extraction + reduce).
 	wikiDeletedTTL = 1 * time.Hour
 
-	// wikiActiveLockTTL is the TTL for the per-KB "batch in progress" flag.
-	// Kept short (relative to total batch runtime) so that if the owning
-	// process crashes without running its `defer Del`, the orphaned lock
-	// expires quickly and newcomers aren't blocked. A periodic renew
-	// (wikiActiveLockRenew) keeps the lock alive while the handler is
-	// genuinely still running.
-	wikiActiveLockTTL = 60 * time.Second
+	// wikiBatchLeaseTTL is the per-KB distributed lease for a running wiki
+	// batch. It is renewed while the worker owns the batch and expires soon
+	// after a crash so queued triggers can resume without waiting for the
+	// task timeout.
+	wikiBatchLeaseTTL = 2 * time.Minute
 
-	// wikiActiveLockRenew is how often the in-flight handler bumps the TTL.
-	// Must be comfortably shorter than wikiActiveLockTTL so a single missed
-	// tick (GC pause, Redis blip) doesn't let the lock slip out from under a
-	// live handler.
-	wikiActiveLockRenew = 20 * time.Second
+	// wikiBatchBusyDelay is the short requeue delay used when another worker
+	// already owns the per-KB batch lease.
+	wikiBatchBusyDelay = 10 * time.Second
 
 	// wikiLLMMaxAttempts is the total attempt count (initial + retries) for
 	// every LLM call routed through generateWithTemplate. 3 was chosen to
@@ -184,6 +166,10 @@ type WikiPendingOp struct {
 	// dbID is set by peekPendingList from task_pending_ops.id. Zero in
 	// constructions made outside the queue (e.g. legacy tests).
 	dbID int64 `json:"-"`
+	// dbIDs contains every row from this peek window that collapsed into this
+	// canonical op by knowledge_id. It lets the consumer delete the pending-op
+	// row(s) before draining the knowledge finalizing counter.
+	dbIDs []int64 `json:"-"`
 }
 
 // wikiIngestService handles the LLM-powered wiki generation pipeline.
@@ -198,10 +184,11 @@ type WikiPendingOp struct {
 //     also writes asynq-level archived rows here uniformly across
 //     every task type.
 //
-// Redis is still used for the per-KB active-batch lock
-// (wiki:active:<kbID>) and the delete tombstone (wiki:deleted:<...>),
+// Redis is still used for the per-KB active-batch token lease
+// (wiki-batch:<kbID>) and the delete tombstone (wiki:deleted:<...>),
 // both of which are correctness-critical short-lived flags rather
-// than data the system should survive without.
+// than data the system should survive without. Lite mode falls back to
+// a process-local keyed mutex via acquireRedisTokenLease.
 type wikiIngestService struct {
 	wikiService    interfaces.WikiPageService
 	kbService      interfaces.KnowledgeBaseService
@@ -220,9 +207,6 @@ type wikiIngestService struct {
 	// attempt is carried by task_pending_ops; the KB-level trigger never
 	// chooses an attempt.
 	spanTracker SpanTracker
-	// liteLocks provides per-KB mutual exclusion in Lite mode (no Redis).
-	// Keys are kbID strings; values are unused (presence = locked).
-	liteLocks sync.Map
 }
 
 // NewWikiIngestService creates a new wiki ingest service
@@ -295,7 +279,7 @@ func (s *wikiIngestService) beginWikiSubspan(ctx context.Context, knowledgeID st
 //
 // Lite mode (no Redis) still works as long as Postgres is reachable —
 // the queue lives in PG, only the active-batch lock is Redis-only and
-// has a process-local fallback (liteLocks) inside the worker.
+// has a process-local keyed-mutex fallback inside the worker.
 func EnqueueWikiIngest(
 	ctx context.Context,
 	task interfaces.TaskEnqueuer,
@@ -421,6 +405,7 @@ func enqueueWikiIngestTrigger(
 	triggerBytes, _ := json.Marshal(payload)
 	t := asynq.NewTask(types.TypeWikiIngest, triggerBytes,
 		asynq.Queue("low"),
+		asynq.TaskID("wiki-ingest:"+payload.KnowledgeBaseID),
 		asynq.MaxRetry(wikiIngestMaxRetry),
 		asynq.Timeout(60*time.Minute),
 		asynq.ProcessIn(delay),
@@ -431,8 +416,8 @@ func enqueueWikiIngestTrigger(
 }
 
 // Handle implements interfaces.TaskHandler for asynq task processing.
-// Wiki ingest tasks are debounced via asynq.Unique + ProcessIn, so at most
-// one ingest task runs per KB at a time. No distributed lock needed.
+// Wiki ingest triggers are debounced by stable TaskID/Unique, while
+// ProcessWikiIngest enforces per-KB single-flight with a token lease.
 func (s *wikiIngestService) Handle(ctx context.Context, t *asynq.Task) error {
 	return s.ProcessWikiIngest(ctx, t)
 }
@@ -465,6 +450,7 @@ func (s *wikiIngestService) peekPendingList(ctx context.Context, kbID string, li
 	}
 
 	all := make([]WikiPendingOp, 0, len(rows))
+	idsByKnowledge := make(map[string][]int64)
 	peekedIDs = make([]int64, 0, len(rows))
 	for _, r := range rows {
 		peekedIDs = append(peekedIDs, r.ID)
@@ -484,6 +470,10 @@ func (s *wikiIngestService) peekPendingList(ctx context.Context, kbID string, li
 			}
 		}
 		op.dbID = r.ID
+		op.dbIDs = []int64{r.ID}
+		if op.KnowledgeID != "" {
+			idsByKnowledge[op.KnowledgeID] = append(idsByKnowledge[op.KnowledgeID], r.ID)
+		}
 		all = append(all, op)
 	}
 
@@ -511,7 +501,11 @@ func (s *wikiIngestService) peekPendingList(ctx context.Context, kbID string, li
 
 	ops = make([]WikiPendingOp, 0, len(reversedUnique))
 	for i := len(reversedUnique) - 1; i >= 0; i-- {
-		ops = append(ops, reversedUnique[i])
+		op := reversedUnique[i]
+		if op.KnowledgeID != "" {
+			op.dbIDs = append([]int64(nil), idsByKnowledge[op.KnowledgeID]...)
+		}
+		ops = append(ops, op)
 	}
 	return ops, peekedIDs
 }
@@ -526,6 +520,17 @@ func (s *wikiIngestService) trimPendingList(ctx context.Context, ids []int64) {
 	if err := s.pendingRepo.DeleteByIDs(ctx, ids); err != nil {
 		logger.Warnf(ctx, "wiki ingest: failed to trim %d pending rows: %v", len(ids), err)
 	}
+}
+
+func (s *wikiIngestService) consumePendingIDs(ctx context.Context, ids []int64) (bool, error) {
+	if s.pendingRepo == nil || len(ids) == 0 {
+		return false, nil
+	}
+	deleted, err := s.pendingRepo.ConsumeByIDs(ctx, ids)
+	if err != nil {
+		return false, err
+	}
+	return deleted > 0, nil
 }
 
 // finalizeWikiSubtask releases this knowledge's slot in the finalizing
@@ -681,6 +686,7 @@ type docIngestResult struct {
 	KnowledgeID string
 	TenantID    uint64
 	Attempt     int
+	OpIDs       []int64
 	DocTitle    string
 	Summary     string // one-line summary of the document (from summary page)
 	// Pages records the wiki pages this document touched, carrying both

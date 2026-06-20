@@ -703,10 +703,9 @@ func (s *wikiPageService) GetStats(ctx context.Context, kbID string) (*types.Wik
 		pendingTasks, _ = s.taskPendingRepo.PendingCount(ctx, wikiTaskType, wikiTaskScope, kbID)
 	}
 	if s.redisClient != nil {
-		// The "active batch in progress" flag is still a Redis-only
-		// short-lived signal (per-process lock with TTL renew); not
-		// worth migrating since it carries no durable state.
-		activeFlag, _ := s.redisClient.Exists(ctx, "wiki:active:"+kbID).Result()
+		// The active batch token lease is a short-lived Redis signal; it
+		// carries no durable state but lets status pages show in-flight work.
+		activeFlag, _ := s.redisClient.Exists(ctx, "wiki-batch:"+kbID).Result()
 		isActive = activeFlag > 0
 	}
 

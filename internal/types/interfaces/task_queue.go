@@ -15,7 +15,7 @@ import (
 //
 // Concurrency model in this revision: PeekBatch does NOT take row
 // locks. Consumers are expected to enforce per-(scope_id) serialization
-// out-of-band (wiki ingest does this via Redis SetNX wiki:active:<kbID>).
+// out-of-band (wiki ingest does this via wiki-batch:<kbID> token leases).
 // The reserved `claimed_at` column lets a future revision adopt
 // pessimistic locking without a schema change.
 type TaskPendingOpsRepository interface {
@@ -34,6 +34,11 @@ type TaskPendingOpsRepository interface {
 	// to consume a successfully-processed batch, and to drop ops that
 	// have been moved to task_dead_letters.
 	DeleteByIDs(ctx context.Context, ids []int64) error
+
+	// ConsumeByIDs removes the given rows and returns how many were actually
+	// deleted. Consumers that use pending-op rows as exactly-once drain tokens
+	// should only finalize side effects when deleted > 0.
+	ConsumeByIDs(ctx context.Context, ids []int64) (int64, error)
 
 	// IncrFailCount increments fail_count for one row and returns the
 	// new value. Returns (0, nil) if the row does not exist (race with

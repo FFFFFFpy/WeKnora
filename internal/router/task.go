@@ -3,7 +3,6 @@ package router
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"log"
 	"os"
 	"strconv"
@@ -92,24 +91,8 @@ func NewAsyncqClient() (*asynq.Client, error) {
 
 // wikiIngestRetryDelay is a fixed, short backoff for wiki ingest lock
 // conflicts. Must be slightly longer than the active-lock TTL's worst-case
-// "just got set" window so the retry is highly likely to succeed without
-// burning through retries; but short enough that users don't feel the stall.
-const wikiIngestRetryDelay = 15 * time.Second
-
 // asynqRetryDelayFunc customizes per-task retry backoff.
-//
-// Default asynq backoff is exponential (≈10s, 40s, 90s, 2.5m, ...), which
-// is appropriate for transient errors like remote HTTP failures. But for
-// wiki ingest lock conflicts (ErrWikiIngestConcurrent), exponential
-// backoff is harmful: a freshly orphaned lock expires in ≤60s, so a 15s
-// fixed retry virtually guarantees the next attempt succeeds. Without
-// this override, a crash-restart cycle can leave a KB unable to make
-// progress for 7–10 minutes while the orphan lock expires AND the retry
-// schedule catches up.
 func asynqRetryDelayFunc(n int, e error, t *asynq.Task) time.Duration {
-	if errors.Is(e, service.ErrWikiIngestConcurrent) {
-		return wikiIngestRetryDelay
-	}
 	return asynq.DefaultRetryDelayFunc(n, e, t)
 }
 

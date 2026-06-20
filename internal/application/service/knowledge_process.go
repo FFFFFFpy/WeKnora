@@ -39,7 +39,10 @@ func (s *knowledgeService) cloneKnowledge(
 		logger.GetLogger(ctx).WithField("knowledge_id", src.ID).Errorf("MoveKnowledge parse status is not completed")
 		return nil
 	}
-	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenantInfo, ok := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	if !ok || tenantInfo == nil {
+		return fmt.Errorf("clone knowledge: tenant context missing")
+	}
 	dst := &types.Knowledge{
 		ID:               uuid.New().String(),
 		TenantID:         targetKB.TenantID,
@@ -382,7 +385,11 @@ func (s *knowledgeService) processChunks(ctx context.Context,
 	}
 
 	// 删除旧的索引数据 — only when vector/keyword indexing is enabled
-	tenantInfo := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	tenantInfo, ok := ctx.Value(types.TenantInfoContextKey).(*types.Tenant)
+	if !ok || tenantInfo == nil {
+		logger.Warnf(ctx, "processChunks: tenant context missing for knowledge %s", knowledge.ID)
+		return
+	}
 	retrieveEngine, err := retriever.CreateRetrieveEngineForKB(
 		ctx, s.retrieveEngine, s.ownership, tenantInfo.ID, kb.VectorStoreID)
 	if err == nil && embeddingModel != nil {

@@ -74,12 +74,21 @@ func (r *taskPendingOpsRepository) PeekBatch(
 // DeleteByIDs removes the given rows in one statement. Empty input is a
 // no-op so the caller can invoke unconditionally at the end of a batch.
 func (r *taskPendingOpsRepository) DeleteByIDs(ctx context.Context, ids []int64) error {
+	_, err := r.ConsumeByIDs(ctx, ids)
+	return err
+}
+
+// ConsumeByIDs removes the given rows and returns how many rows this call
+// consumed. The rows-affected result lets wiki ingest use the pending-op row
+// as the token for exactly-once subtask finalization.
+func (r *taskPendingOpsRepository) ConsumeByIDs(ctx context.Context, ids []int64) (int64, error) {
 	if len(ids) == 0 {
-		return nil
+		return 0, nil
 	}
-	return r.db.WithContext(ctx).
+	res := r.db.WithContext(ctx).
 		Where("id IN ?", ids).
-		Delete(&types.TaskPendingOp{}).Error
+		Delete(&types.TaskPendingOp{})
+	return res.RowsAffected, res.Error
 }
 
 // IncrFailCount atomically bumps fail_count for one row and returns the

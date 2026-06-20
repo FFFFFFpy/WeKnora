@@ -51,7 +51,7 @@ type TaskPendingOp struct {
 	EnqueuedAt time.Time `json:"enqueued_at"`
 	// Optional claim timestamp for future locking workflows. Not used
 	// in the current revision: consumers rely on external mutual
-	// exclusion (e.g. wiki:active:<kbID> Redis SetNX). Reserved column
+	// exclusion (e.g. wiki-batch:<kbID> token leases). Reserved column
 	// so future no-lock parallel workers can flip it inside a row-level
 	// lock without another migration.
 	ClaimedAt *time.Time `json:"claimed_at,omitempty"`
