@@ -668,6 +668,11 @@ type WikiBatchContext struct {
 	// pre-resolved ids and never races on folder creation. Read-only during
 	// reduce.
 	PlannedFolderID map[string]string
+
+	// ImageAttribution is built once before parallel reduce and then treated as
+	// read-only. It only governs this batch's cited content, never whole-page
+	// historical content.
+	ImageAttribution *wikiImageAttributionContext
 }
 
 // SlugUpdate represents a single update operation for a specific slug
@@ -1301,6 +1306,7 @@ func formatExistingTaxonomyForPrompt(paths [][]string) string {
 	}
 	return strings.TrimSpace(buf.String())
 }
+
 // getExistingPageSlugsForKnowledge returns all page slugs that currently
 // reference a given knowledge ID in their source_refs. Used to snapshot
 // state before re-ingest so the reduce phase can reconcile additions vs

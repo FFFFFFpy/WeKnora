@@ -96,6 +96,12 @@ type ImageInfo struct {
 	Caption string `json:"caption"`
 	// 图片OCR文本
 	OCRText string `json:"ocr_text"`
+	// 图片主体类型（person/logo/screenshot/diagram/decorative/unknown）
+	Subject string `json:"subject,omitempty"`
+	// 图片主体名称或引用（如人物名、机构名、产品名）
+	SubjectRef string `json:"subject_ref,omitempty"`
+	// 图片主体识别置信度
+	SubjectConfidence float64 `json:"subject_confidence,omitempty"`
 }
 
 // VideoInfo 表示与 Chunk 关联的视频信息

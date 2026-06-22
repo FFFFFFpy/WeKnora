@@ -366,6 +366,12 @@ type WikiConfig struct {
 	// LLM concurrency / HTTP pool considerations as the Map phase,
 	// plus DB connection pool size.
 	IngestReduceParallel int `yaml:"ingest_reduce_parallel" json:"ingest_reduce_parallel,omitempty"`
+
+	// ImageAttributionDropUnnamedSharedPortraits enables the aggressive policy
+	// for high-confidence person images whose name cannot be resolved and whose
+	// source chunk is cited by multiple slugs. Default false keeps fail-open
+	// behavior for ambiguous portraits.
+	ImageAttributionDropUnnamedSharedPortraits bool `yaml:"image_attribution_drop_unnamed_shared_portraits" json:"image_attribution_drop_unnamed_shared_portraits,omitempty"`
 }
 
 // IngestBatchSizeOrDefault returns IngestBatchSize when set (> 0),
@@ -436,7 +442,6 @@ type WikiPageListResponse struct {
 	PageSize   int         `json:"page_size"`
 	TotalPages int         `json:"total_pages"`
 }
-
 
 // WikiGraphMode enumerates the graph query modes exposed to the API.
 const (

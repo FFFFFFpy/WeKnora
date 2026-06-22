@@ -73,6 +73,11 @@ func CollectImageInfoByChunkIDs(
 				if info.Caption != "" {
 					existing.Caption = info.Caption
 				}
+				if shouldReplaceImageSubject(existing, info) {
+					existing.Subject = info.Subject
+					existing.SubjectRef = info.SubjectRef
+					existing.SubjectConfidence = info.SubjectConfidence
+				}
 				agg.byURL[key] = existing
 			}
 		}
@@ -121,6 +126,33 @@ func CollectImageInfoByChunkIDs(
 		out[id] = string(data)
 	}
 	return out
+}
+
+func shouldReplaceImageSubject(existing, candidate types.ImageInfo) bool {
+	if candidate.Subject == "" && candidate.SubjectRef == "" && candidate.SubjectConfidence == 0 {
+		return false
+	}
+	if existing.Subject == "" && existing.SubjectRef == "" && existing.SubjectConfidence == 0 {
+		return true
+	}
+	if candidate.SubjectConfidence != existing.SubjectConfidence {
+		return candidate.SubjectConfidence > existing.SubjectConfidence
+	}
+	candidateScore := 0
+	existingScore := 0
+	if candidate.Subject != "" {
+		candidateScore++
+	}
+	if candidate.SubjectRef != "" {
+		candidateScore++
+	}
+	if existing.Subject != "" {
+		existingScore++
+	}
+	if existing.SubjectRef != "" {
+		existingScore++
+	}
+	return candidateScore > existingScore
 }
 
 // EnrichSearchResultsImageInfo fills in ImageInfo for SearchResults that have

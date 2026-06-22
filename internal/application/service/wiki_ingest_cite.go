@@ -442,6 +442,15 @@ func (s *wikiIngestService) resolveCitedChunks(
 // referenced chunk, concatenated in the order provided. Chunk IDs that can't
 // be resolved are silently dropped (logged upstream).
 func collectCitedChunkContent(chunkIDs []string, contentByID map[string]string) string {
+	return collectCitedChunkContentForSlug(chunkIDs, contentByID, "", nil)
+}
+
+func collectCitedChunkContentForSlug(
+	chunkIDs []string,
+	contentByID map[string]string,
+	slug string,
+	attribution *wikiImageAttributionContext,
+) string {
 	if len(chunkIDs) == 0 || len(contentByID) == 0 {
 		return ""
 	}
@@ -454,7 +463,7 @@ func collectCitedChunkContent(chunkIDs []string, contentByID map[string]string) 
 		if sb.Len() > 0 {
 			sb.WriteString("\n\n")
 		}
-		sb.WriteString(content)
+		sb.WriteString(enforceCitedImageAttribution(content, slug, attribution))
 	}
 	return sb.String()
 }

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"regexp"
 	"strings"
 	"time"
 
@@ -270,6 +271,18 @@ func (s *ImageMultimodalService) Handle(ctx context.Context, task *asynq.Task) e
 		imageInfo.Caption = caption
 		imgOut["caption_chars"] = len([]rune(caption))
 		imgOut["caption_preview"] = previewText(caption, 200)
+	}
+
+	subject, subjectRef, subjectConfidence := deriveImageSubject(imageInfo.Caption, imageInfo.OCRText)
+	imageInfo.Subject = subject
+	imageInfo.SubjectRef = subjectRef
+	imageInfo.SubjectConfidence = subjectConfidence
+	if subject != "" {
+		imgOut["subject"] = subject
+		imgOut["subject_confidence"] = subjectConfidence
+	}
+	if subjectRef != "" {
+		imgOut["subject_ref"] = subjectRef
 	}
 
 	// Build child chunks for OCR and caption results
@@ -563,6 +576,62 @@ func (s *ImageMultimodalService) readImageBytes(ctx context.Context, payload typ
 // downloadImageFromURL downloads image bytes from an HTTP(S) URL.
 func downloadImageFromURL(imageURL string) ([]byte, error) {
 	return secutils.DownloadBytes(imageURL)
+}
+
+func deriveImageSubject(caption, ocr string) (subject, ref string, confidence float64) {
+	text := strings.TrimSpace(caption + "\n" + ocr)
+	lower := strings.ToLower(text)
+	switch {
+	case containsAny(lower, "logo", "标志", "徽标", "商标"):
+		return "logo", extractSubjectRef(text, []string{"logo", "标志", "徽标", "商标"}), 0.8
+	case containsAny(lower, "截图", "屏幕截图", "界面", "网页", "app screen", "screenshot"):
+		return "screenshot", extractSubjectRef(text, []string{"截图", "界面", "网页", "screenshot"}), 0.7
+	case containsAny(lower, "流程图", "架构图", "图表", "示意图", "diagram", "chart"):
+		return "diagram", extractSubjectRef(text, []string{"流程图", "架构图", "图表", "示意图", "diagram", "chart"}), 0.7
+	case containsAny(lower, "装饰", "背景图", "decorative"):
+		return "decorative", "", 0.75
+	case containsAny(lower, "人像", "肖像", "头像", "人物", "男子", "男性", "女士", "女性", "照片", "合影", "portrait", "headshot", "person", "people"):
+		return "person", extractSubjectRef(text, []string{"人像", "肖像", "头像", "人物", "照片", "portrait", "headshot"}), 0.72
+	default:
+		return "", "", 0
+	}
+}
+
+func containsAny(s string, needles ...string) bool {
+	for _, needle := range needles {
+		if strings.Contains(s, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+func extractSubjectRef(text string, markers []string) string {
+	for _, marker := range markers {
+		patterns := []*regexp.Regexp{
+			regexp.MustCompile(`([\p{Han}A-Za-z][\p{Han}A-Za-z0-9·.\- ]{1,40})\s*` + regexp.QuoteMeta(marker)),
+			regexp.MustCompile(regexp.QuoteMeta(marker) + `(?: of|：|:)?\s*([\p{Han}A-Za-z][\p{Han}A-Za-z0-9·.\- ]{1,40})`),
+		}
+		for _, re := range patterns {
+			m := re.FindStringSubmatch(text)
+			if len(m) < 2 {
+				continue
+			}
+			ref := strings.Trim(m[1], " \t\r\n，。,.：:的")
+			if ref != "" && runeCount(ref) <= 40 {
+				return ref
+			}
+		}
+	}
+	return ""
+}
+
+func runeCount(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
 }
 
 func (s *ImageMultimodalService) checkAndFinalizeAllImages(ctx context.Context, payload types.ImageMultimodalPayload) {

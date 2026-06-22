@@ -492,6 +492,8 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// that don't already have a category (user-curated pages are never churned).
 	batchCtx.PlannedFolderID = s.resolvePlannedFolders(ctx, kb,
 		s.planBatchTaxonomy(ctx, chatModel, kb, slugUpdates, lang))
+	dropUnnamedSharedPortraits := kb.WikiConfig != nil && kb.WikiConfig.ImageAttributionDropUnnamedSharedPortraits
+	batchCtx.ImageAttribution = s.buildWikiImageAttributionContext(ctx, payload.KnowledgeBaseID, payload.TenantID, slugUpdates, dropUnnamedSharedPortraits)
 
 	// 2. REDUCE PHASE (Parallel upserting grouped by Slug)
 	egReduce, reduceCtx := errgroup.WithContext(ctx)
@@ -1516,7 +1518,7 @@ func (s *wikiIngestService) reduceSlugUpdates(
 		chunkContentByID := s.resolveCitedChunks(ctx, tenantID, additions)
 
 		for _, add := range additions {
-			cited := collectCitedChunkContent(add.SourceChunks, chunkContentByID)
+			cited := collectCitedChunkContentForSlug(add.SourceChunks, chunkContentByID, slug, batchCtx.ImageAttribution)
 			// Frame the chunks with the document-level summary body so the
 			// editor model knows BOTH what the document is about AND what
 			// kind of document it is (resume vs announcement vs product
@@ -1524,7 +1526,7 @@ func (s *wikiIngestService) reduceSlugUpdates(
 			// terse to keep the editor grounded on longer or multi-topic
 			// source documents, and calibrating tone (self-reported vs
 			// third-party authoritative) benefits from the richer context.
-			sourceCtx := strings.TrimSpace(add.DocSummary)
+			sourceCtx := strings.TrimSpace(stripImageMarkup(add.DocSummary))
 			sourceCtxBlock := ""
 			if sourceCtx != "" {
 				sourceCtxBlock = fmt.Sprintf("<source_context>\n%s\n</source_context>\n", sourceCtx)
@@ -1539,7 +1541,7 @@ func (s *wikiIngestService) reduceSlugUpdates(
 				// the short Details summary so the page still gets real text.
 				fmt.Fprintf(&newContentBuilder,
 					"<document>\n<title>%s</title>\n%s<content>\n**%s**: %s\n\n%s\n</content>\n</document>\n\n",
-					add.DocTitle, sourceCtxBlock, add.Item.Name, add.Item.Description, add.Item.Details)
+					add.DocTitle, sourceCtxBlock, add.Item.Name, add.Item.Description, stripImageMarkup(add.Item.Details))
 			}
 			docTitles = appendUnique(docTitles, add.DocTitle)
 

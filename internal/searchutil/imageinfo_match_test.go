@@ -93,3 +93,20 @@ func TestImageURLsInContent(t *testing.T) {
 		t.Fatalf("urls: %#v", urls)
 	}
 }
+
+func TestShouldReplaceImageSubject_AsConsistentGroup(t *testing.T) {
+	existing := types.ImageInfo{Subject: "person", SubjectRef: "Alice", SubjectConfidence: 0.8}
+	candidate := types.ImageInfo{Subject: "logo", SubjectConfidence: 0.9}
+	if !shouldReplaceImageSubject(existing, candidate) {
+		t.Fatal("higher-confidence subject group should replace existing group")
+	}
+	merged := existing
+	if shouldReplaceImageSubject(merged, candidate) {
+		merged.Subject = candidate.Subject
+		merged.SubjectRef = candidate.SubjectRef
+		merged.SubjectConfidence = candidate.SubjectConfidence
+	}
+	if merged.Subject != "logo" || merged.SubjectRef != "" || merged.SubjectConfidence != 0.9 {
+		t.Fatalf("subject fields were not replaced as a group: %+v", merged)
+	}
+}
