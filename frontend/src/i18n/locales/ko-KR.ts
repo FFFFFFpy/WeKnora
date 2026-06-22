@@ -2452,6 +2452,26 @@ export default {
           concurrency: "비동기 작업 워커 동시 처리 수",
         },
       },
+      keyDescriptions: {
+        auth: {
+          registration_mode:
+            "셀프 가입 모드입니다. self_serve = 누구나 계정을 만들 수 있음; invite_only = 공개 가입을 끄고 Owner/Admin만 초대 가능. 저장 즉시 적용되며, self_serve는 스팸 가입이 들어올 수 있으니 신중히 사용하세요.",
+        },
+        ssrf: {
+          whitelist:
+            "SSRF 보호 허용 목록입니다. example.com / *.foo.com / 10.0.0.0/8 / 2001:db8::1 형식을 입력할 수 있습니다. 저장 즉시 적용됩니다. SSRF_WHITELIST_EXTRA 환경 변수는 배포자가 관리하며 여기서 덮어쓰지 않습니다.",
+        },
+        tenant: {
+          max_owned_per_user:
+            "슈퍼유저가 아닌 사용자가 셀프 서비스로 소유할 수 있는 최대 테넌트 수입니다. 테넌트 생성 시마다 읽으며 저장 즉시 적용됩니다. 0은 내장 기본값 10을 사용하고, 음수는 제한을 완전히 해제합니다(공개 배포에는 권장하지 않음).",
+          default_storage_quota_gb:
+            "신규 테넌트 생성 시 기본으로 할당되는 저장 용량(GB)으로, 벡터·원본·텍스트·인덱스 등을 포함합니다. 생성 시에만 읽으며, 변경은 이후 생성되는 테넌트에만 적용되고 기존 테넌트에는 소급되지 않습니다. 0 또는 음수는 내장 기본값 10GB를 사용합니다.",
+        },
+        asynq: {
+          concurrency:
+            "비동기 작업 worker 동시 처리 수(asynq 스레드 풀 크기)입니다. 문서 파싱·임베딩 등은 대부분 I/O 대기이므로 값을 올리면 대량 업로드 대기 시간을 줄일 수 있습니다. 적용하려면 서비스 프로세스를 재시작해야 합니다.",
+        },
+      },
       enumLabels: {
         auth: {
           registration_mode: {
@@ -3447,6 +3467,9 @@ export default {
       tabGraphTip: "Wiki 페이지 간의 링크 관계 그래프(페이지 링크 그래프)입니다. '지식 베이스 설정 → 지식 그래프'에서 구성하는 LLM 기반 엔티티-관계 지식 그래프와는 다른 개념입니다.",
       searchPlaceholder: "Wiki 페이지 검색...",
       searchNoResults: "일치하는 페이지가 없습니다",
+      viewModeToggle: "디렉터리 보기 전환",
+      viewTree: "트리 보기",
+      viewList: "목록 보기",
       loadMore: "더 불러오기 ({remaining}개 남음)",
       filterAll: "전체 유형",
       newFolder: "새 디렉터리",
@@ -4426,6 +4449,32 @@ export default {
       createFailed: "MCP 서비스 생성 실패",
       updateFailed: "MCP 서비스 업데이트 실패",
     },
+    customHeaders: {
+      label: "사용자 지정 헤더(선택 사항)",
+      desc: "모든 MCP 요청에 추가되는 HTTP 헤더로, 기업 게이트웨이 인증, 추적 등에 자주 사용됩니다.",
+      add: "헤더 추가",
+      keyPlaceholder: "헤더 이름",
+      valuePlaceholder: "헤더 값",
+    },
+    codeImport: {
+      toggle: "코드에서 가져오기",
+      hint: "표준 mcpServers JSON 설정을 붙여넣으면 양식이 자동으로 채워집니다",
+      placeholder:
+        '{\n  "mcpServers": {\n    "my-server": {\n      "url": "https://example.com/sse"\n    }\n  }\n}',
+      parse: "파싱 후 채우기",
+      editOverwriteHint: "가져오기는 현재 양식을 덮어씁니다(저장된 자격 증명은 영향받지 않으며, 저장을 눌러야 적용됩니다)",
+      errors: {
+        empty: "먼저 설정을 붙여넣어 주세요",
+        invalidJson: "파싱할 수 없습니다. JSON 형식을 확인해 주세요",
+        noServer: "MCP 서비스 설정을 찾을 수 없습니다",
+        missingUrl: "설정에 url이 없습니다",
+        stdioUnsupported: "stdio(command/args) 설정은 지원되지 않습니다. url이 포함된 원격 설정을 사용해 주세요",
+      },
+      toasts: {
+        filled: "양식이 채워졌습니다. 확인 후 저장해 주세요",
+        multipleServers: "여러 서비스가 감지되어 첫 번째 항목을 가져왔습니다: {name}",
+      },
+    },
   },
   promptTemplate: {
     noTemplates: "아직 템플릿이 없습니다.",
@@ -4911,6 +4960,8 @@ export default {
       fileTypeWord: 'Word 문서',
       fileTypePpt: '프레젠테이션',
       fileTypeExcel: 'Excel 스프레드시트',
+      fileTypeEbook: '전자책',
+      fileTypeWebArchive: '웹 아카이브',
       fileTypeCsv: 'CSV 파일',
       fileTypeText: '일반 텍스트',
       fileTypeJson: 'JSON 파일',

@@ -68,6 +68,7 @@ type RouterParams struct {
 	SystemHandler                *handler.SystemHandler
 	MCPServiceHandler            *handler.MCPServiceHandler
 	MCPCredentialsHandler        *handler.MCPCredentialsHandler
+	MCPOAuthHandler              *handler.MCPOAuthHandler
 	WebSearchHandler             *handler.WebSearchHandler
 	WebSearchProviderHandler     *handler.WebSearchProviderHandler
 	WebSearchCredentialsHandler  *handler.WebSearchProviderCredentialsHandler
@@ -218,7 +219,7 @@ func NewRouter(params RouterParams) *gin.Engine {
 		RegisterInitializationRoutes(v1, params.InitializationHandler, rbacGuards)
 		RegisterSystemRoutes(v1, params.SystemHandler, rbacGuards)
 		RegisterSystemAdminRoutes(v1, params.SystemHandler, params.AuditLogHandler, rbacGuards)
-		RegisterMCPServiceRoutes(v1, params.MCPServiceHandler, params.MCPCredentialsHandler, rbacGuards)
+		RegisterMCPServiceRoutes(v1, params.MCPServiceHandler, params.MCPCredentialsHandler, params.MCPOAuthHandler, rbacGuards)
 		RegisterWebSearchRoutes(v1, params.WebSearchHandler, rbacGuards)
 		RegisterWebSearchProviderRoutes(v1, params.WebSearchProviderHandler, params.WebSearchCredentialsHandler, rbacGuards)
 		RegisterVectorStoreRoutes(v1, params.VectorStoreHandler, rbacGuards)
@@ -395,6 +396,8 @@ func RegisterKnowledgeBaseRoutes(r *gin.RouterGroup, handler *handler.KnowledgeB
 		// so callers can't poke at KBs they can't see.
 		kb.PUT("/:id/pin", g.Viewer(), g.KBAccessRead("id"), handler.TogglePinKnowledgeBase)
 		// 混合搜索 — Viewer+ 且对 KB 有 read 权限 (read-only)
+		// POST is preferred; GET with JSON body is kept for backward compatibility (#1727).
+		kb.POST("/:id/hybrid-search", g.Viewer(), g.KBAccessRead("id"), handler.HybridSearch)
 		kb.GET("/:id/hybrid-search", g.Viewer(), g.KBAccessRead("id"), handler.HybridSearch)
 		// 拷贝知识库 — Contributor+ (副本归调用者所有；不需要原 KB 的所有权)
 		kb.POST("/copy", g.Contributor(), handler.CopyKnowledgeBase)
@@ -837,8 +840,15 @@ func RegisterMCPServiceRoutes(
 	r *gin.RouterGroup,
 	handler *handler.MCPServiceHandler,
 	credHandler *handler.MCPCredentialsHandler,
+	oauthHandler *handler.MCPOAuthHandler,
 	g *rbacGuards,
 ) {
+	// MCP OAuth provider redirect. Registered OUTSIDE the /mcp-services group
+	// to avoid a static-vs-":id" route conflict, and left unauthenticated
+	// (allow-listed in middleware/auth.go) because the third-party browser
+	// redirect carries no WeKnora bearer — the single-use state authenticates.
+	r.GET("/mcp-oauth/callback", oauthHandler.Callback)
+
 	mcpServices := r.Group("/mcp-services")
 	{
 		// Create MCP service — Admin+
@@ -864,6 +874,12 @@ func RegisterMCPServiceRoutes(
 		// MCP tool human approval (issue #1173) — Viewer+ to read, Admin+ to set policy
 		mcpServices.GET("/:id/tool-approvals", g.Viewer(), handler.ListMCPToolApprovals)
 		mcpServices.PUT("/:id/tool-approvals/:tool_name", g.Admin(), handler.SetMCPToolApproval)
+		// Per-user OAuth authorization flow. Viewer+ may authorize/inspect/
+		// revoke their own token; the callback is the separate public route
+		// registered above.
+		mcpServices.POST("/:id/oauth/authorize-url", g.Viewer(), oauthHandler.AuthorizeURL)
+		mcpServices.GET("/:id/oauth/status", g.Viewer(), oauthHandler.Status)
+		mcpServices.DELETE("/:id/oauth/token", g.Viewer(), oauthHandler.Revoke)
 	}
 
 	agentTool := r.Group("/agent")
@@ -1720,6 +1736,7 @@ func RegisterDataSourceRoutes(
 		// Connection and resource management — Admin+
 		ds.POST("/:id/validate", g.Admin(), handler.ValidateConnection)
 		ds.GET("/:id/resources", g.Admin(), handler.ListAvailableResources)
+		ds.POST("/:id/resource-ancestors", g.Admin(), handler.ResolveResourceAncestors)
 
 		// Sync management — Admin+
 		ds.POST("/:id/sync", g.Admin(), handler.ManualSync)
