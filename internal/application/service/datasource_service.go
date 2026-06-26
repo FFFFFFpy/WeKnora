@@ -9,6 +9,7 @@ import (
 	"mime/multipart"
 	"net/textproto"
 	"reflect"
+	"strings"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/datasource"
@@ -80,6 +81,12 @@ func (s *DataSourceService) CreateDataSource(ctx context.Context, ds *types.Data
 	}
 
 	// Validate configuration
+	if cfg, err := ds.ParseConfig(); err == nil && cfg != nil {
+		cfg.StripNonSecretCredentials(ds.Type)
+		if blob, err := cfg.ToJSON(); err == nil {
+			ds.Config = blob
+		}
+	}
 	if err := s.validateDataSourceConfig(ctx, ds); err != nil {
 		return nil, err
 	}
@@ -176,6 +183,7 @@ func (s *DataSourceService) UpdateDataSource(ctx context.Context, ds *types.Data
 			} else {
 				merged.Credentials = nil
 			}
+			merged.StripNonSecretCredentials(ds.Type)
 			if blob, err := merged.ToJSON(); err == nil {
 				ds.Config = blob
 			}
@@ -192,7 +200,7 @@ func (s *DataSourceService) UpdateDataSource(ctx context.Context, ds *types.Data
 	if mergedCfg != nil && existingParsedCfg != nil {
 		configActuallyChanged = !reflect.DeepEqual(*mergedCfg, *existingParsedCfg)
 	}
-	hasCreds := mergedCfg != nil && mergedCfg.HasCredentials()
+	hasCreds := mergedCfg != nil && mergedCfg.HasConfiguredCredentials(ds.Type)
 	if hasCreds && (ds.Type != existing.Type || configActuallyChanged) {
 		if err := s.validateDataSourceConfig(ctx, ds); err != nil {
 			return nil, err
@@ -236,6 +244,7 @@ func (s *DataSourceService) UpdateDataSourceCredentials(
 		parsed = &types.DataSourceConfig{Type: existing.Type}
 	}
 	parsed.Credentials = credentials
+	parsed.StripNonSecretCredentials(existing.Type)
 	blob, err := parsed.ToJSON()
 	if err != nil {
 		return nil, err
@@ -269,8 +278,17 @@ func (s *DataSourceService) ClearDataSourceCredentials(ctx context.Context, id s
 	if err != nil {
 		return err
 	}
-	if parsed == nil || !parsed.HasCredentials() {
+	if parsed == nil {
 		return nil
+	}
+	parsed.StripNonSecretCredentials(existing.Type)
+	if !parsed.HasConfiguredCredentials(existing.Type) {
+		blob, err := parsed.ToJSON()
+		if err != nil {
+			return err
+		}
+		existing.Config = blob
+		return s.dsRepo.Update(ctx, existing)
 	}
 	parsed.Credentials = nil
 	blob, err := parsed.ToJSON()
@@ -562,6 +580,16 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 		return nil
 	}
 
+	if _, err := s.kbService.GetKnowledgeBaseByID(ctx, ds.KnowledgeBaseID); err != nil {
+		logger.Warnf(ctx, "knowledge base not found (likely deleted), cancelling sync: kb=%s ds=%s err=%v",
+			ds.KnowledgeBaseID, payload.DataSourceID, err)
+		syncLog.Status = types.SyncLogStatusCanceled
+		syncLog.FinishedAt = timePtr(time.Now().UTC())
+		syncLog.ErrorMessage = "knowledge base has been deleted"
+		_ = s.syncLogRepo.Update(ctx, syncLog)
+		return nil
+	}
+
 	wasPaused := ds.Status == types.DataSourceStatusPaused
 
 	// Get connector
@@ -612,7 +640,24 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 		logger.Infof(ctx, "incremental sync fetched %d items", len(items))
 	}
 
+	var fetchWarnings []string
+	var partialFetch *datasource.PartialFetchError
+	if errors.As(fetchErr, &partialFetch) {
+		fetchWarnings = partialFetch.Details
+		fetchErr = nil
+	}
+
 	if fetchErr != nil {
+		// Persist connector cursor even when fetch failed so transient outages
+		// (e.g. RSS feed downtime) do not force a full re-ingest on recovery.
+		if nextCursor != nil {
+			if cursorJSON, cerr := nextCursor.ToJSON(); cerr == nil {
+				ds.LastSyncCursor = cursorJSON
+				if uerr := s.dsRepo.UpdateSyncState(ctx, ds); uerr != nil {
+					logger.Warnf(ctx, "failed to persist sync cursor after fetch error: %v", uerr)
+				}
+			}
+		}
 		logger.Errorf(ctx, "fetch operation failed: %v", fetchErr)
 		syncLog.Status = types.SyncLogStatusFailed
 		syncLog.FinishedAt = timePtr(time.Now().UTC())
@@ -651,13 +696,13 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 	ctx = context.WithValue(ctx, types.TenantInfoContextKey, tenant)
 
 	// Auto-tag: find or create a tag for this data source so synced items are easily identifiable
-	autoTagID := ""
+	autoTagIDs := []string{}
 	autoTagName := ds.Name
 	if autoTag, tagErr := s.tagService.FindOrCreateTagByName(ctx, ds.KnowledgeBaseID, autoTagName); tagErr != nil {
 		logger.Warnf(ctx, "failed to find/create auto-tag %q: %v (proceeding without tag)", autoTagName, tagErr)
 	} else if autoTag != nil {
-		autoTagID = autoTag.ID
-		logger.Infof(ctx, "using auto-tag %q (id=%s) for data source sync", autoTagName, autoTagID)
+		autoTagIDs = append(autoTagIDs, autoTag.ID)
+		logger.Infof(ctx, "using auto-tag %q (id=%s) for data source sync", autoTagName, autoTag.ID)
 	}
 
 	for _, item := range items {
@@ -684,7 +729,7 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 			continue
 		}
 
-		isUpdate, err := s.ingestItem(ctx, ds, &item, autoTagID)
+		isUpdate, err := s.ingestItem(ctx, ds, &item, autoTagIDs)
 		if err != nil {
 			// Duplicate file/URL is not a failure — count as skipped
 			var dupErr *types.DuplicateKnowledgeError
@@ -717,7 +762,17 @@ func (s *DataSourceService) ProcessSync(ctx context.Context, task *asynq.Task) e
 	}
 
 	ds.LastSyncAt = timePtr(time.Now().UTC())
-	s.updateSyncRunResult(ctx, ds, syncLog, result, resultJSON, types.SyncLogStatusSuccess, "", wasPaused)
+	syncStatus := types.SyncLogStatusSuccess
+	syncErrorMessage := ""
+	if len(fetchWarnings) > 0 {
+		syncStatus = types.SyncLogStatusPartial
+		syncErrorMessage = fmt.Sprintf("Some feeds failed: %s", strings.Join(fetchWarnings, "; "))
+		for _, w := range fetchWarnings {
+			result.Errors = append(result.Errors, w)
+		}
+		resultJSON, _ = result.ToJSON()
+	}
+	s.updateSyncRunResult(ctx, ds, syncLog, result, resultJSON, syncStatus, syncErrorMessage, wasPaused)
 
 	logger.Infof(ctx, "data source sync completed: ds=%s created=%d updated=%d deleted=%d",
 		payload.DataSourceID, syncLog.ItemsCreated, syncLog.ItemsUpdated, syncLog.ItemsDeleted)
@@ -831,7 +886,7 @@ func (s *DataSourceService) validateDataSourceConfig(ctx context.Context, ds *ty
 //   - Has URL only      → CreateKnowledgeFromURL  (让 WeKnora 下载并解析)
 //
 // Returns (isUpdate, error) — isUpdate is true when an existing item was replaced.
-func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource, item *types.FetchedItem, tagID string) (bool, error) {
+func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource, item *types.FetchedItem, tagIDs []string) (bool, error) {
 	channel := ds.Type // e.g. "feishu", "notion"
 
 	metadata := map[string]string{
@@ -874,7 +929,7 @@ func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource
 			metadata,
 			nil,           // use KB default for multimodal
 			item.FileName, // customFileName — must include extension for file-type validation
-			tagID,         // auto-tag from data source
+			tagIDs,        // auto-tag from data source
 			channel,
 			nil,
 		)
@@ -891,7 +946,7 @@ func (s *DataSourceService) ingestItem(ctx context.Context, ds *types.DataSource
 			"",  // auto-detect file type
 			nil, // use KB default for multimodal
 			item.Title,
-			tagID, // auto-tag from data source
+			tagIDs, // auto-tag from data source
 			channel,
 			nil,
 		)

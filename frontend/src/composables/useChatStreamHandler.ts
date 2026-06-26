@@ -501,7 +501,7 @@ export function useChatStreamHandler(options: UseChatStreamHandlerOptions) {
       onAgentChunkBound?.(message, true)
     }
 
-    message.isAgentMode = true
+    ensureAgentMessageShell(message, dataId)
 
     if (
       loading.value &&

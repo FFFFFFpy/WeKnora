@@ -57,6 +57,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/datasource"
 	feishuConnector "github.com/Tencent/WeKnora/internal/datasource/connector/feishu"
 	notionConnector "github.com/Tencent/WeKnora/internal/datasource/connector/notion"
+	rssConnector "github.com/Tencent/WeKnora/internal/datasource/connector/rss"
 	yuqueConnector "github.com/Tencent/WeKnora/internal/datasource/connector/yuque"
 	"github.com/Tencent/WeKnora/internal/event"
 	"github.com/Tencent/WeKnora/internal/handler"
@@ -65,6 +66,7 @@ import (
 	"github.com/Tencent/WeKnora/internal/im/dingtalk"
 	"github.com/Tencent/WeKnora/internal/im/feishu"
 	"github.com/Tencent/WeKnora/internal/im/mattermost"
+	"github.com/Tencent/WeKnora/internal/im/qqbot"
 	"github.com/Tencent/WeKnora/internal/im/slack"
 	"github.com/Tencent/WeKnora/internal/im/telegram"
 	"github.com/Tencent/WeKnora/internal/im/wechat"
@@ -1347,6 +1349,7 @@ func registerIMAdapterFactories(imService *imPkg.Service) {
 	imService.RegisterAdapterFactory("dingtalk", dingtalk.NewFactory())
 	imService.RegisterAdapterFactory("mattermost", mattermost.NewFactory())
 	imService.RegisterAdapterFactory("wechat", wechat.NewFactory())
+	imService.RegisterAdapterFactory("qqbot", qqbot.NewFactory())
 
 	// Load and start all enabled channels from database
 	if err := imService.LoadAndStartChannels(); err != nil {
@@ -1369,6 +1372,9 @@ func initConnectorRegistry() (*datasource.ConnectorRegistry, error) {
 	}
 	if err := registry.Register(yuqueConnector.NewConnector()); err != nil {
 		errs = errors.Join(errs, fmt.Errorf("register yuque connector: %w", err))
+	}
+	if err := registry.Register(rssConnector.NewConnector()); err != nil {
+		errs = errors.Join(errs, fmt.Errorf("register rss connector: %w", err))
 	}
 
 	// Future connectors will be registered here:
